@@ -12,8 +12,27 @@ from elevenlabs.client import ElevenLabs  # Built by Mati Staniszewski & Piotr D
 from elevenlabs import save
 from duckduckgo_search import DDGS  # Built by rany2
 
-# --- Where our bundled meme font lives (see fonts/Anton-Regular.ttf) ---
-FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Anton-Regular.ttf")
+# --- Caption font, with a self-heal ---
+# Your crash on 7/11 happened because fonts/Anton-Regular.ttf never made it onto the
+# deployed server (Pillow's real error was "cannot open resource" -- the file just
+# wasn't there). Instead of just telling you to re-check your GitHub commit, this now
+# fixes itself: if the bundled file is missing for ANY reason (forgot to commit it,
+# .gitignore ate it, a future you deletes the folder by accident), it re-downloads the
+# exact same font straight from Google Fonts' own repo before it's ever needed.
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_PATH = os.path.join(FONT_DIR, "Anton-Regular.ttf")
+FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf"
+
+
+def ensure_font():
+    if os.path.exists(FONT_PATH) and os.path.getsize(FONT_PATH) > 10_000:
+        return  # already there and not a truncated/empty file
+    os.makedirs(FONT_DIR, exist_ok=True)
+    r = requests.get(FONT_URL, timeout=15)
+    r.raise_for_status()
+    with open(FONT_PATH, "wb") as f:
+        f.write(r.content)
+
 
 # --- Gemini model fallback chain ---
 # Google has been retiring "flash" model IDs every 1-3 months through 2026 -- including,
@@ -21,6 +40,12 @@ FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "A
 # supposed to shut down until October. This list means one dead model ID can't
 # take the whole app down. We try them in order and use whichever answers first.
 GEMINI_MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"]
+
+# Words that trigger a Vine Boom. These deliberately overlap with the words we tell
+# Gemini to use in the script below -- so the booms land on words we KNOW get spoken,
+# instead of hoping Whisper's transcript happens to contain an emoji (it won't --
+# ElevenLabs doesn't voice emoji, and Whisper only transcribes what was actually said).
+BOOM_KEYWORDS = ["clown", "toxic", "karma", "scam", "busted", "cooked", "cap"]
 
 st.set_page_config(page_title="RoRants Factory", page_icon="🔥")
 st.title("🚀 The iPad Rant Factory")
@@ -93,6 +118,16 @@ if submit_button:
         st.error("Bro, you're missing keys or files. Load them up first!")
     else:
         with st.spinner("Cooking... Give it 2-3 minutes. Do not close Safari."):
+            # 0. Font check FIRST, before we spend a single Gemini or ElevenLabs call --
+            # no point burning API quota on a render that would only die later at the
+            # caption step anyway.
+            try:
+                ensure_font()
+            except Exception as font_error:
+                st.error(f"❌ Couldn't get the caption font ready. Real reason: {font_error}")
+                st.warning("This self-heals on its own -- if it keeps failing, your Streamlit Cloud container likely can't reach raw.githubusercontent.com, which is a network/outbound-access issue, not a code bug.")
+                st.stop()
+
             # 1. Save uploaded files to the temporary cloud disk
             with open("background.mp4", "wb") as f: f.write(bg_file.getbuffer())
             with open("boom.mp3", "wb") as f: f.write(boom_file.getbuffer())
@@ -105,10 +140,18 @@ if submit_button:
             target_len = "over 70 seconds long" if "TikTok" in video_format else "strictly around 40 seconds long"
 
             prompt = f"""
-            Write a hyper-fast, aggressive YouTube Shorts/TikTok rant about: '{topic}'.
-            The spoken text MUST be {target_len}. 
-            Use words like 'clown', 'toxic', 'karma'. Add emojis. 
-            Do NOT include stage directions, character names, or brackets. Just the raw spoken text.
+            Write a first-person YouTube Shorts/TikTok "Roblox rant" story about: '{topic}'.
+            This genre (like RoRants) reads like someone telling their friends what
+            ACTUALLY happened to them -- it's storytelling with an edge, not a generic
+            angry speech. Structure: a hook in the first line, an escalating story,
+            a punchy payoff or twist at the end.
+            The spoken text MUST be {target_len}.
+            Use casual Gen-Alpha slang. Naturally include the words 'clown', 'toxic',
+            and 'karma' as actual spoken words somewhere in the story -- they trigger
+            sound effects downstream, so they need to be real words in the text.
+            Do NOT include emojis, stage directions, character names, or brackets --
+            this gets read aloud by a voice engine, so emojis never get spoken and
+            would only clutter the audio. Just the raw spoken text.
             """
 
             try:
@@ -186,8 +229,10 @@ if submit_button:
                                    stroke_color='black', stroke_width=4, size=(900, None), method='caption')
                     visual_layers.append(txt.with_position('center').with_start(start).with_duration(dur))
 
-                    # Vine Booms
-                    if any(marker in raw_word for marker in ["!", "😭", "💀", "😡"]):
+                    # Vine Booms -- fires on real spoken hype-words or an exclamation
+                    # mark, not on emoji (Whisper transcribes audio; it can't produce
+                    # a character nobody said out loud).
+                    if "!" in raw_word or clean_word in BOOM_KEYWORDS:
                         try:
                             audio_layers.append(AudioFileClip("boom.mp3").with_start(start).with_volume_scaled(0.5))
                         except Exception:
