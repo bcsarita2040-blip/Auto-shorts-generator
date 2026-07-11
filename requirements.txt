@@ -1,8 +1,24 @@
-streamlit
-moviepy==1.0.3
-pydub
-elevenlabs
-openai-whisper
-duckduckgo_search
-google-generativeai
-requests
+# Core app
+streamlit>=1.38.0
+
+# HTTP + scraping
+requests>=2.31.0
+duckduckgo_search>=8.0.0
+# ^ this one churns fast because it scrapes DDG's HTML, not a real API.
+# It WILL break again eventually when DuckDuckGo changes their page layout.
+# That's not a "you did something wrong" bug, it's the nature of scraping.
+
+# Audio / transcription
+pydub>=0.25.1
+openai-whisper>=20240930
+
+# Video
+moviepy>=2.2.0,<3.0.0
+# ^ pinned below the next major so a future moviepy 3.x can't silently break
+# your renders again the way the 1.x -> 2.x jump just did to you.
+
+# AI engines
+google-genai>=2.0.0,<3.0.0
+# ^ this REPLACES google-generativeai, which is fully deprecated.
+# Do not install google-generativeai anymore -- delete it if it's still listed.
+elevenlabs>=2.50.0,<3.0.0
