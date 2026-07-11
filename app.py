@@ -53,8 +53,8 @@ st.write("Print high-retention TikToks and Shorts from the cloud.")
 
 with st.sidebar:
     st.header("🔑 Engine Keys")
-    gemini_key = st.text_input("Gemini API Key", type="password")
-    eleven_key = st.text_input("ElevenLabs API Key", type="password")
+    gemini_key = st.text_input("Gemini API Key", type="password").strip()
+    eleven_key = st.text_input("ElevenLabs API Key", type="password").strip()
 
 
 def scrape_meme(keyword, index):
@@ -85,6 +85,19 @@ def resolve_voice_id(client, name="Adam"):
     return results.voices[0].voice_id
 
 
+def chipmunk_speed(audio_segment, speed=1.15):
+    """The actual trick behind the 'famous sped-up Adam voice': override the frame
+    rate to play the samples back faster, which drags the pitch up right along with
+    the tempo -- that's what makes it sound chipmunky instead of just quick. Then
+    resample back to a normal rate so it's still a standard, playable MP3.
+    speed=1.0 is a no-op: plain, un-sped-up Adam."""
+    if speed == 1.0:
+        return audio_segment
+    new_frame_rate = int(audio_segment.frame_rate * speed)
+    sped_up = audio_segment._spawn(audio_segment.raw_data, overrides={'frame_rate': new_frame_rate})
+    return sped_up.set_frame_rate(audio_segment.frame_rate)
+
+
 def generate_script(client, prompt):
     """Try each candidate model in order until one actually answers."""
     last_error = None
@@ -105,6 +118,8 @@ def generate_script(client, prompt):
 with st.form("masterpiece_form"):
     topic = st.text_area("🔥 What is the drama about?", "A toxic 12-year-old tried to hack my Roblox account, so I got him banned.")
     video_format = st.radio("⏱️ Target Platform Length", ["Shorts (Under 60s)", "TikTok (Over 60s)"])
+    voice_speed = st.slider("🐿️ Sped-Up 'Rant Channel' Voice", min_value=1.0, max_value=1.3, value=1.15, step=0.05,
+                             help="The classic high-pitched, fast Adam voice you hear on RoRants and every other rant channel. 1.0 = normal Adam, no chipmunk.")
 
     st.write("📁 Drop Your Raw Assets Here:")
     bg_file = st.file_uploader("Gameplay Background (MP4)", type=["mp4"])
@@ -187,6 +202,12 @@ if submit_button:
             combined_sound = AudioSegment.empty()
             for chunk in audio_chunks:
                 combined_sound += chunk
+
+            # The famous sped-up, high-pitched rant-channel Adam voice. Applied here,
+            # BEFORE export and BEFORE Whisper ever sees the file -- so the word
+            # timestamps, caption timing, and boom placement are all computed on the
+            # sped-up timeline and stay perfectly in sync automatically.
+            combined_sound = chipmunk_speed(combined_sound, voice_speed)
             combined_sound.export("voice.mp3", format="mp3")
 
             # 4. Transcription
