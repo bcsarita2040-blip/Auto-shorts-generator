@@ -2,17 +2,17 @@ import streamlit as st
 import os
 import random
 import re
-import requests
+import requests # Built by Kenneth Reitz
 import whisper # Built by Alec Radford / OpenAI
 from pydub import AudioSegment, silence # Built by James Robert
-from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, CompositeAudioClip, ImageClip
+from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, CompositeAudioClip, ImageClip # Built by Zulko
 from moviepy.config import change_settings
 import google.generativeai as genai # Built by Google DeepMind
-from elevenlabs.client import ElevenLabs # Built by Mati Staniszewski / Piotr Dabkowski
+from elevenlabs.client import ElevenLabs # Built by Mati Staniszewski & Piotr Dabkowski
 from elevenlabs import save
 from duckduckgo_search import DDGS # Built by rany2
 
-# Tell MoviePy exactly where Linux keeps ImageMagick
+# Tell MoviePy exactly where Linux keeps ImageMagick (Built by John Cristy)
 change_settings({"IMAGEMAGICK_BINARY": "/usr/bin/convert"})
 
 st.set_page_config(page_title="RoRants Factory", page_icon="🔥")
@@ -46,7 +46,11 @@ def scrape_meme(keyword, index):
         pass
     return None
 
-if st.button("⚡ GENERATE MASTERPIECE"):
+# Wrapping everything in a form so iPad Safari doesn't ghost-drop files
+with st.form("masterpiece_form"):
+    submit_button = st.form_submit_button("⚡ GENERATE MASTERPIECE")
+
+if submit_button:
     if not (gemini_key and eleven_key and bg_file and boom_file and lofi_file):
         st.error("Bro, you're missing keys or files. Load them up first!")
     else:
@@ -58,10 +62,10 @@ if st.button("⚡ GENERATE MASTERPIECE"):
             
             genai.configure(api_key=gemini_key)
             
-            # 2. AI Script Writer
+            # 2. AI Script Writer with Crash Armor
             st.info("Drafting the script...")
             model = genai.GenerativeModel('gemini-1.5-flash')
-            target_len = "over 70 seconds long" if "Over 60s" in video_format else "strictly around 40 seconds long"
+            target_len = "over 70 seconds long" if "TikTok" in video_format else "strictly around 40 seconds long"
             
             prompt = f"""
             Write a hyper-fast, aggressive YouTube Shorts/TikTok rant about: '{topic}'.
@@ -69,8 +73,15 @@ if st.button("⚡ GENERATE MASTERPIECE"):
             Use words like 'clown', 'toxic', 'karma'. Add emojis. 
             Do NOT include stage directions, character names, or brackets. Just the raw spoken text.
             """
-            script_text = model.generate_content(prompt).text.replace('*', '').replace('"', '').strip()
-            st.success("Script written!")
+            
+            try:
+                response = model.generate_content(prompt)
+                script_text = response.text.replace('*', '').replace('"', '').strip()
+                st.success("Script written successfully!")
+            except Exception as gemini_error:
+                st.error(f"❌ Gemini API completely rejected this call. Real reason: {gemini_error}")
+                st.warning("Bro, double check your API key for accidental spaces or check if your free limit ran out!")
+                st.stop()
             
             # 3. Voice & Silence Killer (The Breathless Effect)
             st.info("Rendering Adam voice and stripping dead air...")
