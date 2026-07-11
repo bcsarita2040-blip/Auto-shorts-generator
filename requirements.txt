@@ -1,0 +1,8 @@
+streamlit
+moviepy
+pydub
+elevenlabs
+openai-whisper
+duckduckgo_search
+google-generativeai
+requests
