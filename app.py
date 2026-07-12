@@ -1,51 +1,54 @@
 import streamlit as st
 import os
+import json
 import random
 import re
 import requests  # Built by Kenneth Reitz
 import whisper  # Built by Alec Radford / OpenAI
 from pydub import AudioSegment, silence  # Built by James Robert
-from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, CompositeAudioClip, ImageClip  # Built by Zulko (Kirill Lykov's fork lives on, but Zulko started it)
+from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, CompositeAudioClip, ImageClip  # Built by Zulko
 from moviepy.video.fx import Loop
-from google import genai  # Built by Google DeepMind -- the NEW unified SDK. google.generativeai is dead as of Nov 30, 2025.
+from google import genai  # Built by Google DeepMind -- unified SDK
+from google.genai import types
 from elevenlabs.client import ElevenLabs  # Built by Mati Staniszewski & Piotr Dabkowski
 from elevenlabs import save
 from duckduckgo_search import DDGS  # Built by rany2
 
-# --- Caption font, with a self-heal ---
-# Your crash on 7/11 happened because fonts/Anton-Regular.ttf never made it onto the
-# deployed server (Pillow's real error was "cannot open resource" -- the file just
-# wasn't there). Instead of just telling you to re-check your GitHub commit, this now
-# fixes itself: if the bundled file is missing for ANY reason (forgot to commit it,
-# .gitignore ate it, a future you deletes the folder by accident), it re-downloads the
-# exact same font straight from Google Fonts' own repo before it's ever needed.
+# --- Fonts. Pick one in the UI -- all of them self-heal the same way (auto-download
+# if missing), so you don't need to hand-commit any font files to your repo anymore. ---
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-FONT_PATH = os.path.join(FONT_DIR, "Anton-Regular.ttf")
-FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf"
+FONT_OPTIONS = {
+    "Anton (classic meme Impact-style)": "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf",
+    "Bebas Neue (tall condensed)": "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneue/BebasNeue-Regular.ttf",
+    "Archivo Black (chunky sans)": "https://raw.githubusercontent.com/google/fonts/main/ofl/archivoblack/ArchivoBlack-Regular.ttf",
+}
 
 
-def ensure_font():
-    if os.path.exists(FONT_PATH) and os.path.getsize(FONT_PATH) > 10_000:
-        return  # already there and not a truncated/empty file
+def ensure_font(font_name):
+    url = FONT_OPTIONS[font_name]
+    path = os.path.join(FONT_DIR, url.split("/")[-1])
+    if os.path.exists(path) and os.path.getsize(path) > 10_000:
+        return path
     os.makedirs(FONT_DIR, exist_ok=True)
-    r = requests.get(FONT_URL, timeout=15)
+    r = requests.get(url, timeout=15)
     r.raise_for_status()
-    with open(FONT_PATH, "wb") as f:
+    with open(path, "wb") as f:
         f.write(r.content)
+    return path
 
 
-# --- Gemini model fallback chain ---
-# Google has been retiring "flash" model IDs every 1-3 months through 2026 -- including,
-# as of this month, throwing early/unannounced 404s on models that officially aren't
-# supposed to shut down until October. This list means one dead model ID can't
-# take the whole app down. We try them in order and use whichever answers first.
+# --- Gemini model fallback chain -- see earlier notes, model IDs keep dying ---
 GEMINI_MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"]
 
-# Words that trigger a Vine Boom. These deliberately overlap with the words we tell
-# Gemini to use in the script below -- so the booms land on words we KNOW get spoken,
-# instead of hoping Whisper's transcript happens to contain an emoji (it won't --
-# ElevenLabs doesn't voice emoji, and Whisper only transcribes what was actually said).
+# Backup meme keywords, used only if Gemini's own suggested words (see generate_script)
+# come back empty. Gemini's list is now the primary source since it's guaranteed to
+# actually appear in the script -- this is just a safety net.
+STATIC_MEME_KEYWORDS = ["scam", "clown", "toxic", "hacker", "karma", "crying", "mom", "brother"]
+
+# Words that trigger a Vine Boom -- overlap with words we told Gemini to actually say.
 BOOM_KEYWORDS = ["clown", "toxic", "karma", "scam", "busted", "cooked", "cap"]
+
+MIN_CAPTION_SECONDS = 0.25  # below this, a caption reads as "flickering," not "fast"
 
 st.set_page_config(page_title="RoRants Factory", page_icon="🔥")
 st.title("🚀 The iPad Rant Factory")
@@ -58,12 +61,16 @@ with st.sidebar:
 
 
 def scrape_meme(keyword, index):
+    """Pulls one meme-flavored image for a keyword. DDG is free but unmoderated, and
+    some image hosts silently 403 requests with no real User-Agent -- this header
+    cuts down on that specific silent-failure mode."""
     filename = f"meme_{index}.jpg"
+    headers = {"User-Agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"}
     try:
         with DDGS() as ddg:
             results = list(ddg.images(f"{keyword} meme png", max_results=1))
             if results:
-                img_data = requests.get(results[0]['image'], timeout=5).content
+                img_data = requests.get(results[0]['image'], headers=headers, timeout=6).content
                 with open(filename, 'wb') as f:
                     f.write(img_data)
                 return filename
@@ -74,23 +81,17 @@ def scrape_meme(keyword, index):
 
 def resolve_voice_id(client, name="Adam"):
     """The old SDK let you pass voice='Adam' as a plain string. The new SDK wants the
-    real voice_id, so we look it up by name once instead of hardcoding an ID that could
-    change or that I could get wrong typing it from memory."""
+    real voice_id, so we look it up by name once instead of hardcoding an ID."""
     results = client.voices.search(search=name)
     if not results.voices:
-        raise ValueError(
-            f"No ElevenLabs voice matching '{name}'. Check the spelling or pick a voice "
-            f"from your Voice Library and swap the name here."
-        )
+        raise ValueError(f"No ElevenLabs voice matching '{name}'. Check the spelling.")
     return results.voices[0].voice_id
 
 
 def chipmunk_speed(audio_segment, speed=1.15):
-    """The actual trick behind the 'famous sped-up Adam voice': override the frame
-    rate to play the samples back faster, which drags the pitch up right along with
-    the tempo -- that's what makes it sound chipmunky instead of just quick. Then
-    resample back to a normal rate so it's still a standard, playable MP3.
-    speed=1.0 is a no-op: plain, un-sped-up Adam."""
+    """The famous sped-up, high-pitched Adam voice: override the frame rate to play
+    back faster (which drags pitch up with it), then resample to a standard rate so
+    it's still a normal, playable MP3. speed=1.0 is a no-op."""
     if speed == 1.0:
         return audio_segment
     new_frame_rate = int(audio_segment.frame_rate * speed)
@@ -98,28 +99,62 @@ def chipmunk_speed(audio_segment, speed=1.15):
     return sped_up.set_frame_rate(audio_segment.frame_rate)
 
 
+def crop_to_vertical(clip, target_w=1080, target_h=1920):
+    """Scales the source so it fully COVERS a 1080x1920 frame, then center-crops the
+    overflow. This replaces the old .resize(newsize=(1080,1920)), which forced your
+    footage into that box by stretching it -- that's the squish you saw."""
+    target_ratio = target_w / target_h
+    clip_ratio = clip.w / clip.h
+    if clip_ratio > target_ratio:
+        resized = clip.resized(height=target_h)
+    else:
+        resized = clip.resized(width=target_w)
+    return resized.cropped(x_center=resized.w / 2, y_center=resized.h / 2, width=target_w, height=target_h)
+
+
 def generate_script(client, prompt):
-    """Try each candidate model in order until one actually answers."""
+    """Asks Gemini for the script AND a handful of meme-worthy words pulled FROM that
+    exact script, as structured JSON -- so meme matching is tied to words we KNOW are
+    in the text, instead of hoping a fixed guess-list happens to show up."""
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "script": {"type": "string"},
+                "meme_words": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["script", "meme_words"],
+        },
+    )
     last_error = None
     for model_name in GEMINI_MODEL_CANDIDATES:
         try:
-            response = client.models.generate_content(model=model_name, contents=prompt)
-            return response.text, model_name
+            response = client.models.generate_content(model=model_name, contents=prompt, config=config)
+            data = json.loads(response.text)
+            script = (data.get("script") or "").strip()
+            words = [str(w).strip().lower() for w in data.get("meme_words", []) if str(w).strip()]
+            if not script:
+                raise ValueError("Gemini returned an empty script.")
+            return script, words, model_name
         except Exception as e:
             last_error = e
             continue
     raise last_error
 
 
-# --- Everything the render needs lives inside ONE form now: topic, format, and all
-# 3 uploads. On the old version only the button was in the form, so every file you
-# picked fired an immediate rerun of the whole script -- that's your "ghost drop" on
-# iPad Safari. Batching it all here means nothing runs until you hit the button. ---
+# --- Everything the render needs lives inside ONE form: topic, script override,
+# length, voice, boom volume, font, and all 3 uploads. Nothing runs until you hit
+# the button -- that's what fixed the iPad Safari "ghost drop" file issue. ---
 with st.form("masterpiece_form"):
     topic = st.text_area("🔥 What is the drama about?", "A toxic 12-year-old tried to hack my Roblox account, so I got him banned.")
-    video_format = st.radio("⏱️ Target Platform Length", ["Shorts (Under 60s)", "TikTok (Over 60s)"])
+    custom_script = st.text_area("✍️ Your Own Script (optional)", placeholder="Leave blank and I'll write one from the description above instead.")
+    target_seconds = st.slider("⏱️ Target Length (seconds)", min_value=15, max_value=180, value=45, step=5,
+                                help="Longer renders composite way more caption clips -- stay under ~90s until you've confirmed shorter ones run clean on your Streamlit Cloud RAM limit.")
     voice_speed = st.slider("🐿️ Sped-Up 'Rant Channel' Voice", min_value=1.0, max_value=1.3, value=1.15, step=0.05,
-                             help="The classic high-pitched, fast Adam voice you hear on RoRants and every other rant channel. 1.0 = normal Adam, no chipmunk.")
+                             help="The classic high-pitched, fast Adam voice from RoRants and every other rant channel. 1.0 = normal Adam, no chipmunk.")
+    boom_volume = st.slider("💥 Vine Boom Volume", min_value=0.0, max_value=1.5, value=0.7, step=0.1)
+    font_choice = st.selectbox("🔤 Caption Font", list(FONT_OPTIONS.keys()))
 
     st.write("📁 Drop Your Raw Assets Here:")
     bg_file = st.file_uploader("Gameplay Background (MP4)", type=["mp4"])
@@ -133,50 +168,51 @@ if submit_button:
         st.error("Bro, you're missing keys or files. Load them up first!")
     else:
         with st.spinner("Cooking... Give it 2-3 minutes. Do not close Safari."):
-            # 0. Font check FIRST, before we spend a single Gemini or ElevenLabs call --
-            # no point burning API quota on a render that would only die later at the
-            # caption step anyway.
+            # 0. Font check first -- fail fast before spending any API quota.
             try:
-                ensure_font()
+                font_path = ensure_font(font_choice)
             except Exception as font_error:
                 st.error(f"❌ Couldn't get the caption font ready. Real reason: {font_error}")
-                st.warning("This self-heals on its own -- if it keeps failing, your Streamlit Cloud container likely can't reach raw.githubusercontent.com, which is a network/outbound-access issue, not a code bug.")
                 st.stop()
 
-            # 1. Save uploaded files to the temporary cloud disk
+            # 1. Save uploaded files
             with open("background.mp4", "wb") as f: f.write(bg_file.getbuffer())
             with open("boom.mp3", "wb") as f: f.write(boom_file.getbuffer())
             with open("lofi.mp3", "wb") as f: f.write(lofi_file.getbuffer())
 
             gemini_client = genai.Client(api_key=gemini_key)
+            gemini_meme_words = []
 
-            # 2. AI Script Writer with Crash Armor
-            st.info("Drafting the script...")
-            target_len = "over 70 seconds long" if "TikTok" in video_format else "strictly around 40 seconds long"
-
-            prompt = f"""
-            Write a first-person YouTube Shorts/TikTok "Roblox rant" story about: '{topic}'.
-            This genre (like RoRants) reads like someone telling their friends what
-            ACTUALLY happened to them -- it's storytelling with an edge, not a generic
-            angry speech. Structure: a hook in the first line, an escalating story,
-            a punchy payoff or twist at the end.
-            The spoken text MUST be {target_len}.
-            Use casual Gen-Alpha slang. Naturally include the words 'clown', 'toxic',
-            and 'karma' as actual spoken words somewhere in the story -- they trigger
-            sound effects downstream, so they need to be real words in the text.
-            Do NOT include emojis, stage directions, character names, or brackets --
-            this gets read aloud by a voice engine, so emojis never get spoken and
-            would only clutter the audio. Just the raw spoken text.
-            """
-
-            try:
-                raw_text, used_model = generate_script(gemini_client, prompt)
-                script_text = raw_text.replace('*', '').replace('"', '').strip()
-                st.success(f"Script written successfully! (engine: {used_model})")
-            except Exception as gemini_error:
-                st.error(f"❌ Gemini API completely rejected this call. Real reason: {gemini_error}")
-                st.warning("Double check your API key for accidental spaces, confirm the key has billing/free-tier access in AI Studio, and note the daily free quota resets at midnight Pacific time.")
-                st.stop()
+            # 2. Script: yours if you gave one, otherwise Gemini writes it
+            if custom_script.strip():
+                script_text = custom_script.strip()
+                used_model = "your own script"
+                st.success("Using your custom script.")
+            else:
+                st.info("Drafting the script...")
+                prompt = f"""
+                Write a first-person YouTube Shorts/TikTok "Roblox rant" story about: '{topic}'.
+                This genre (like RoRants) reads like someone telling their friends what
+                ACTUALLY happened to them -- storytelling with an edge, not a generic angry
+                speech. Structure: hook in the first line, escalating story, punchy payoff
+                or twist at the end.
+                The spoken text MUST be approximately {target_seconds} seconds long when read
+                aloud at a natural pace (roughly {round(target_seconds * 2.5)} words).
+                Use casual Gen-Alpha slang. Naturally include the words 'clown', 'toxic', and
+                'karma' as actual spoken words somewhere in the story.
+                Also return 4-6 short, punchy words or two-word phrases taken FROM the script
+                itself that would make good reaction meme images.
+                Do NOT include emojis, stage directions, character names, or brackets in the
+                script -- it gets read aloud by a voice engine, so emojis never get spoken.
+                """
+                try:
+                    script_text, gemini_meme_words, used_model = generate_script(gemini_client, prompt)
+                    script_text = script_text.replace('*', '').replace('"', '').strip()
+                    st.success(f"Script written successfully! (engine: {used_model})")
+                except Exception as gemini_error:
+                    st.error(f"❌ Gemini API completely rejected this call. Real reason: {gemini_error}")
+                    st.warning("Double check your API key, confirm billing/free-tier access in AI Studio, and note the daily free quota resets at midnight Pacific time.")
+                    st.stop()
 
             # 3. Voice & Silence Killer (The Breathless Effect)
             st.info("Rendering Adam voice and stripping dead air...")
@@ -203,16 +239,15 @@ if submit_button:
             for chunk in audio_chunks:
                 combined_sound += chunk
 
-            # The famous sped-up, high-pitched rant-channel Adam voice. Applied here,
-            # BEFORE export and BEFORE Whisper ever sees the file -- so the word
-            # timestamps, caption timing, and boom placement are all computed on the
-            # sped-up timeline and stay perfectly in sync automatically.
+            # The famous sped-up voice, applied BEFORE export and BEFORE Whisper ever
+            # sees the file -- so captions, boom placement, and video length all get
+            # computed on the sped-up timeline and stay in sync automatically.
             combined_sound = chipmunk_speed(combined_sound, voice_speed)
             combined_sound.export("voice.mp3", format="mp3")
 
             # 4. Transcription
             st.info("Mapping word timestamps...")
-            whisper_model = whisper.load_model("tiny")  # Tiny prevents cloud memory crashes
+            whisper_model = whisper.load_model("tiny")
             transcription = whisper_model.transcribe("voice.mp3", word_timestamps=True)
 
             # 5. Video Compilation
@@ -221,45 +256,38 @@ if submit_button:
             ambient_music = AudioFileClip("lofi.mp3").with_volume_scaled(0.1).with_duration(vocal_track.duration)
 
             source_video = VideoFileClip("background.mp4")
-            # Loop video if it's too short for the 60s+ TikToks
             if source_video.duration < vocal_track.duration:
                 source_video = source_video.with_effects([Loop(duration=vocal_track.duration + 2)])
 
             max_start = max(0, source_video.duration - vocal_track.duration - 1)
             start_marker = random.uniform(0, max_start)
-            video_slice = source_video.subclipped(start_marker, start_marker + vocal_track.duration).resized(new_size=(1080, 1920))
+            video_slice = crop_to_vertical(source_video.subclipped(start_marker, start_marker + vocal_track.duration))
 
             audio_layers = [vocal_track, ambient_music]
             visual_layers = [video_slice]
 
-            meme_keywords = ["scam", "clown", "toxic", "hacker", "karma", "crying", "mom", "brother"]
+            meme_keywords = list(dict.fromkeys(gemini_meme_words + STATIC_MEME_KEYWORDS))  # Gemini's words first, deduped
             img_tracker = []
             img_count = 0
+            meme_status = []
 
             for segment in transcription['segments']:
                 for w in segment['words']:
                     raw_word = w['word']
                     clean_word = re.sub(r'[^\w\s]', '', raw_word).strip().lower()
                     start, end = w['start'], w['end']
-                    dur = max(0.1, end - start)
+                    dur = max(MIN_CAPTION_SECONDS, end - start)
 
-                    # Bounce Text -- rendered with Pillow now, not ImageMagick, so it needs
-                    # a real font FILE, not a font name. That's why FONT_PATH points at the
-                    # bundled Anton-Regular.ttf instead of the string 'Impact'.
-                    txt = TextClip(text=raw_word.upper(), font=FONT_PATH, font_size=100, color='yellow',
+                    txt = TextClip(text=raw_word.upper(), font=font_path, font_size=100, color='yellow',
                                    stroke_color='black', stroke_width=4, size=(900, None), method='caption')
                     visual_layers.append(txt.with_position('center').with_start(start).with_duration(dur))
 
-                    # Vine Booms -- fires on real spoken hype-words or an exclamation
-                    # mark, not on emoji (Whisper transcribes audio; it can't produce
-                    # a character nobody said out loud).
                     if "!" in raw_word or clean_word in BOOM_KEYWORDS:
                         try:
-                            audio_layers.append(AudioFileClip("boom.mp3").with_start(start).with_volume_scaled(0.5))
+                            audio_layers.append(AudioFileClip("boom.mp3").with_start(start).with_volume_scaled(boom_volume))
                         except Exception:
                             pass
 
-                    # Meme Overlays
                     if clean_word in meme_keywords and img_count < 5:
                         img_path = scrape_meme(clean_word, img_count)
                         if img_path:
@@ -268,22 +296,27 @@ if submit_button:
                                 visual_layers.append(meme_clip)
                                 img_tracker.append(img_path)
                                 img_count += 1
+                                meme_status.append(f"✅ {clean_word}")
                             except Exception:
-                                pass
+                                meme_status.append(f"⚠️ {clean_word} (downloaded but failed to composite)")
+                        else:
+                            meme_status.append(f"❌ {clean_word} (DDG returned nothing)")
+
+            if meme_status:
+                st.caption("Meme fetch results: " + ", ".join(meme_status))
+            else:
+                st.caption("No meme-matching words landed in this script, so no meme overlays this render.")
 
             final_audio = CompositeAudioClip(audio_layers)
             master_render = CompositeVideoClip(visual_layers, size=(1080, 1920)).with_audio(final_audio)
 
             st.info("Exporting final MP4...")
             output_file = "VIRAL_RANT.mp4"
-            # Lower bitrate and 24fps strictly to avoid hitting Streamlit's 1GB RAM limit
             master_render.write_videofile(output_file, fps=24, codec="libx264", audio_codec="aac", bitrate="2500k", preset="ultrafast", threads=2)
 
-            # 6. Expose Download Button
             with open(output_file, "rb") as file:
                 st.download_button(label="📥 DOWNLOAD TO IPAD CAMERA ROLL", data=file, file_name="Viral_RoRant.mp4", mime="video/mp4")
 
-            # Clean up cloud disk
             for f in ["voice.mp3", "raw_voice.mp3", output_file] + img_tracker:
                 if os.path.exists(f): os.remove(f)
 
