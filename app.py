@@ -3,7 +3,7 @@ import os
 import io
 import json
 import re
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from typing import Any
 
 from duckduckgo_search import DDGS  # Built by deedy5
@@ -18,8 +18,6 @@ WORDS_PER_SECOND = 2.5
 ELEVENLABS_ADAM_VOICE_ID_FALLBACK = "pNInz6obpgDQGcFmaJgB"
 STOCK_PHOTO_EXCLUSION = ['freepik', 'alamy', 'shutterstock', 'gettyimages', 'stock', 'dreamstime', 'pinterest']
 
-# Gemini model IDs get deprecated/shut down frequently -- try each in order, use
-# whichever actually answers, so one dead model can't take the whole pipeline down.
 GEMINI_MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"]
 
 DEFAULT_STATE = {
@@ -65,8 +63,7 @@ def clean_script_text(text):
 
 
 def trim_to_exact_words(text, target_words):
-    """Deterministic, guaranteed-safe fallback: clip on a real word boundary, never
-    mid-word, never raises. Doesn't invent words to pad a too-short result."""
+    """Deterministic fallback: clip on a real word boundary, never mid-word."""
     words = text.split()
     if len(words) <= target_words:
         return text
@@ -74,8 +71,7 @@ def trim_to_exact_words(text, target_words):
 
 
 def build_research_draft(client, category, current_year):
-    """Path A only. Grounds the script in real, current search results instead of
-    letting Gemini invent a 'controversy' from nothing."""
+    """Path A only. Grounds the script in real search results."""
     query = f"{category} Roblox controversy drama {current_year}"
     try:
         with DDGS() as ddg:
@@ -98,8 +94,7 @@ def build_research_draft(client, category, current_year):
     drama/controversy, write a factual, grounded research draft (700-800 words)
     summarizing what's actually happening or happened -- specific names, events, and
     details where the snippets provide them. Do not invent facts the snippets don't
-    support. This draft will be adapted into a story script next, so include enough
-    concrete detail to write from.
+    support.
 
     Search snippets:
     {snippets}
@@ -109,10 +104,7 @@ def build_research_draft(client, category, current_year):
 
 
 def create_final_script(client, source_material, target_words):
-    """Up to 6 attempts to hit the exact word count directly. If none land exactly,
-    prefer the shortest candidate that's still >= target_words (clean trim-down);
-    otherwise take the longest candidate available. The deterministic trimmer is the
-    guarantee -- Gemini hitting it exactly on its own is just a nice-to-have."""
+    """Generates exact word count script with deterministic trimming guarantee."""
     candidates = []
     for _ in range(6):
         prev_note = ""
@@ -124,7 +116,7 @@ def create_final_script(client, source_material, target_words):
         Adapt the following material into a first-person "Roblox rant" story script,
         RoRants-style: hook in the first line, escalating story, punchy twist or payoff
         at the end, casual Gen-Alpha slang. No emojis, stage directions, character
-        names, or brackets -- this gets read aloud by a voice engine.
+        names, or brackets.
 
         Material:
         {source_material}
@@ -151,9 +143,7 @@ def create_final_script(client, source_material, target_words):
 
 
 def find_meme_moments(client, script_text):
-    """Numbers every word so Gemini references real indices instead of guessing --
-    LLMs are unreliable at precise position-counting without this kind of scaffold.
-    Every index is still clamped afterward regardless."""
+    """Numbers every word so Gemini references real index placements."""
     words = script_text.split()
     if not words:
         return []
@@ -208,8 +198,7 @@ def find_meme_moments(client, script_text):
 
 
 def find_meme_images(query, max_results=5):
-    """Over-fetches, then filters out stock-photo domains, since those aren't memes
-    and usually aren't free to use in monetized content anyway."""
+    """Filters out stock photo domains from search results."""
     try:
         with DDGS() as ddg:
             results = list(ddg.images(query, max_results=max_results * 3))
@@ -229,9 +218,6 @@ def find_meme_images(query, max_results=5):
 # ---------- ElevenLabs / audio helpers ----------
 
 def resolve_voice_id(client, name="Adam"):
-    """Looks up the real voice_id by name; falls back to the known Adam premade ID
-    if the search call itself fails for any reason, so a lookup hiccup can't kill
-    voice generation outright."""
     try:
         results = client.voices.search(search=name)
         if results.voices:
@@ -242,9 +228,6 @@ def resolve_voice_id(client, name="Adam"):
 
 
 def chipmunk_speed(audio_segment, speed=1.15):
-    """The famous sped-up, high-pitched Adam voice: override the frame rate to play
-    back faster (pitch rises with it), then resample to a standard rate. speed=1.0
-    is a no-op."""
     if speed == 1.0:
         return audio_segment
     new_frame_rate = int(audio_segment.frame_rate * speed)
@@ -253,9 +236,7 @@ def chipmunk_speed(audio_segment, speed=1.15):
 
 
 def strip_gaps(sound):
-    """Wider silence/keep_silence window than a plain gap-strip -- keep_silence=15ms
-    was clipping word endings and gluing them into the next word once sped up. This
-    keeps enough tail on each word that the speed-up doesn't turn it into mush."""
+    """Prevents word endings from getting chopped off during speedup."""
     chunks = silence.split_on_silence(sound, min_silence_len=200, silence_thresh=-40, keep_silence=50)
     combined = AudioSegment.empty()
     for chunk in chunks:
@@ -269,25 +250,31 @@ def _consume_audio_stream(audio_stream):
     return b"".join(audio_stream)
 
 
-def export_exact_duration_mp3(sound, target_ms, path, max_iterations=3):
-    """MP3 encoding can introduce a bit of encoder padding, so a file trimmed to
-    exactly target_ms in memory can decode back to a slightly different length once
-    it's actually an MP3 on disk. This re-decodes the real exported file and nudges
-    the trim point until the ACTUAL file matches, instead of trusting the in-memory
-    slice length."""
-    working = sound[:target_ms] if len(sound) >= target_ms else sound
-    reloaded = working
+def export_exact_duration_mp3(sound, target_ms, path, max_iterations=4):
+    """Pads short audio with trailing silence or trims long audio to hit target_ms EXACTLY."""
+    def fit_segment(seg, length):
+        if len(seg) >= length:
+            return seg[:length]
+        pad = AudioSegment.silent(
+            duration=length - len(seg),
+            frame_rate=seg.frame_rate
+        ).set_channels(seg.channels).set_sample_width(seg.sample_width)
+        return (seg + pad)[:length]
+
+    working = fit_segment(sound, target_ms)
+
     for _ in range(max_iterations):
-        working.export(path, format="mp3")
+        working.export(path, format="mp3", bitrate="128k")
         reloaded = AudioSegment.from_mp3(path)
-        drift = len(reloaded) - target_ms
+        drift = target_ms - len(reloaded)
+
         if abs(drift) <= 20:
             return reloaded, path
-        if drift > 0 and len(working) > drift:
-            working = working[: len(working) - drift]
-        else:
-            break
-    working.export(path, format="mp3")
+
+        new_length = max(1, len(working) + drift)
+        working = fit_segment(working, new_length)
+
+    working.export(path, format="mp3", bitrate="128k")
     reloaded = AudioSegment.from_mp3(path)
     return reloaded, path
 
@@ -339,7 +326,7 @@ with st.form("pipeline_form"):
 
 if run_button:
     if not gemini_key:
-        st.error("Bro, you need your Gemini key in the sidebar first.")
+        st.error("Add your Gemini key in the sidebar first.")
     else:
         gemini_client = genai.Client(api_key=gemini_key)
         using_path_b = bool(custom_material.strip())
@@ -374,7 +361,7 @@ if run_button:
 
                 st.success(f"Pipeline done ({'Path B — custom material' if using_path_b else 'Path A — ' + event_category}). {len(script.split())} words, {len(moments)} meme moments found.")
             except Exception as e:
-                st.error(f"❌ Pipeline failed. Real reason: {e}")
+                st.error(f"❌ Pipeline failed: {e}")
 
 # ---------- Research draft (Path A only) ----------
 
@@ -391,10 +378,8 @@ if st.session_state.research_draft:
 if st.session_state.final_script:
     st.subheader("📝 Script")
 
-
     def _mark_stale():
         st.session_state.voice_stale = True
-
 
     st.text_area("Editable script -- editing this marks any existing voiceover as stale.",
                   key="script_editor", height=220, on_change=_mark_stale)
@@ -426,7 +411,7 @@ if st.session_state.final_script:
     voice_label = "🔄 Regenerate Voice" if st.session_state.audio_bytes else "🎙️ Generate Voiceover"
     if st.button(voice_label):
         if not eleven_key:
-            st.error("Bro, you need your ElevenLabs key in the sidebar first.")
+            st.error("Add your ElevenLabs key in the sidebar first.")
         else:
             with st.spinner("Rendering exact-length voiceover..."):
                 try:
@@ -441,7 +426,7 @@ if st.session_state.final_script:
                     st.session_state.last_voiced_script = st.session_state.script_editor
                     st.success(f"Voice ready -- {achieved_ms / 1000:.2f}s (target was {duration_seconds}s).")
                 except Exception as e:
-                    st.error(f"❌ ElevenLabs rejected this call. Real reason: {e}")
+                    st.error(f"❌ ElevenLabs error: {e}")
 
     if st.session_state.audio_bytes:
         st.audio(st.session_state.audio_bytes, format="audio/mp3")
