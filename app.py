@@ -209,7 +209,7 @@ with tab2:
 
 
     def parse_hunter_response(raw_text, minimum_words):
-        """Extract Gemini's JSON and enforce both script length and clean meme terms."""
+        """Extract tagged story/meme sections and enforce length and clean meme terms."""
         cleaned = (raw_text or "").strip()
         if cleaned.startswith("```"):
             lines = cleaned.splitlines()
@@ -219,14 +219,18 @@ with tab2:
                 lines = lines[:-1]
             cleaned = "\n".join(lines).strip()
 
-        json_start = cleaned.find("{")
-        json_end = cleaned.rfind("}")
-        if json_start == -1 or json_end == -1:
-            raise ValueError("Gemini did not return the requested JSON object.")
+        story_tag = "===STORY==="
+        memes_tag = "===MEMES==="
+        if story_tag not in cleaned or memes_tag not in cleaned:
+            raise ValueError("Gemini did not return the requested STORY and MEMES sections.")
 
-        payload = json.loads(cleaned[json_start:json_end + 1])
-        story_idea = str(payload.get("story_idea") or payload.get("story_concept") or "").strip()
-        raw_terms = payload.get("meme_search_terms") or payload.get("search_terms") or []
+        _, story_and_memes = cleaned.split(story_tag, 1)
+        if memes_tag not in story_and_memes:
+            raise ValueError("Gemini returned the section tags in the wrong order.")
+
+        story_block, memes_block = story_and_memes.split(memes_tag, 1)
+        story_idea = story_block.strip()
+        raw_terms = memes_block.splitlines()
 
         if not story_idea:
             raise ValueError("Gemini returned no story draft.")
@@ -239,17 +243,14 @@ with tab2:
 
         meme_search_terms = []
         seen_terms = set()
-        if isinstance(raw_terms, list):
-            for term in raw_terms:
-                if not isinstance(term, str):
-                    continue
-                term = re.sub(r"^\s*(?:\d+[.)-]?|[-•])\s*", "", term).strip(" \t\r\n\"'")
-                term = re.sub(r"\s+", " ", term)
-                term_word_count = count_script_words(term)
-                term_key = term.casefold()
-                if 2 <= term_word_count <= 8 and term_key not in seen_terms:
-                    meme_search_terms.append(term)
-                    seen_terms.add(term_key)
+        for term in raw_terms:
+            term = re.sub(r"^\s*(?:\d+[.)-]?|[-•])\s*", "", term).strip(" \t\r\n\"'")
+            term = re.sub(r"\s+", " ", term)
+            term_word_count = count_script_words(term)
+            term_key = term.casefold()
+            if 2 <= term_word_count <= 8 and term_key not in seen_terms:
+                meme_search_terms.append(term)
+                seen_terms.add(term_key)
 
         if len(meme_search_terms) < 3:
             raise ValueError("Gemini returned fewer than three short, usable meme search terms.")
@@ -348,11 +349,15 @@ Aim for exactly {target_words} words and never return fewer than {target_words} 
 Also output 3 to 5 short, exact meme search terms. Each must be 2 to 8 words and look like a direct image
 search, not a sentence or explanation. Good examples: "crying cat meme png", "spiderman pointing meme gif".
 
-Return ONLY valid JSON in this exact shape:
-{{
-  "story_idea": "the full spoken story draft",
-  "meme_search_terms": ["crying cat meme png", "spiderman pointing meme gif", "shocked reaction meme png"]
-}}
+Return ONLY standard plain text with these exact section tags and layout. Do not return JSON and do not
+wrap the response in a Markdown code fence. Quotation marks are allowed naturally inside the story:
+===STORY===
+[The full spoken story draft goes here...]
+
+===MEMES===
+- crying cat meme png
+- spiderman pointing meme gif
+- shocked reaction meme png
 """
 
                 hunter_models = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.5-flash"]
@@ -372,7 +377,6 @@ Return ONLY valid JSON in this exact shape:
                                     model=model_name,
                                     contents=hunter_prompt + retry_note,
                                     config={
-                                        "response_mime_type": "application/json",
                                         "max_output_tokens": 4096,
                                     },
                                 )
@@ -387,8 +391,9 @@ Return ONLY valid JSON in this exact shape:
                                 retry_note = f"""
 
 CRITICAL CORRECTION FOR THIS RETRY: The previous output failed validation: {e}
-Regenerate the entire JSON response from scratch. Keep the story fully grounded in one supplied real event,
-make the story at least {target_words} words, and keep every meme term between 2 and 8 words.
+Regenerate the entire tagged plain-text response from scratch. Use ===STORY=== before the full story and
+===MEMES=== before the meme list. Do not return JSON or a Markdown code fence. Keep the story fully grounded
+in one supplied real event, make it at least {target_words} words, and keep every meme term between 2 and 8 words.
 """
                         if story_idea:
                             break
