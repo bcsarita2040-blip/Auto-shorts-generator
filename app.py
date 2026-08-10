@@ -134,6 +134,19 @@ def resolve_voice_id(client, name="Adam"):
     return ELEVENLABS_ADAM_VOICE_ID_FALLBACK
 
 
+def check_quota(client, script_text):
+    """Rough pre-flight check so a too-long script fails fast with a clear message
+    instead of a mid-call API rejection. ElevenLabs' quota is character-based; this
+    treats that as a stand-in for the 'credits' the API error talks about -- usually
+    a close estimate, but check your live dashboard for the exact number."""
+    try:
+        sub = client.user.subscription.get()
+        remaining = sub.character_limit - sub.character_count
+        return remaining, len(script_text)
+    except Exception:
+        return None, None
+
+
 def chipmunk_speed(audio_segment, speed=1.15):
     if speed == 1.0:
         return audio_segment
@@ -284,6 +297,11 @@ if run_voice:
         with st.spinner("Generating pitch-shifted voiceover..."):
             try:
                 eleven_client = ElevenLabs(api_key=eleven_key)
+                remaining, needed = check_quota(eleven_client, raw_script)
+                if remaining is not None and needed > remaining:
+                    st.error(f"❌ Not enough ElevenLabs quota: ~{remaining} characters left, this script needs ~{needed}. "
+                             f"Shorten it, wait for your quota to reset, or upgrade your plan at elevenlabs.io.")
+                    st.stop()
                 voice_id = resolve_voice_id(eleven_client, "Adam")
                 audio_bytes, achieved_ms = generate_voice(
                     eleven_client, raw_script, voice_id, voice_speed, duration_seconds
