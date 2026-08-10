@@ -1,12 +1,11 @@
-import streamlit as st
+import streamlit as st  # Built by Adrien Treuille, Thiago Teixeira, & Amanda Kelly
 import os
 import io
 import json
 import re
-from datetime import datetime, timezone, date
 from typing import Any
 
-from ddgs import DDGS  # Built by deedy5 (renamed from duckduckgo_search)
+from duckduckgo_search import DDGS  # Built by deedy5
 from google import genai  # Built by Google DeepMind
 from google.genai import types
 from elevenlabs.client import ElevenLabs  # Built by Mati Staniszewski & Piotr Dabkowski
@@ -14,35 +13,27 @@ from pydub import AudioSegment, silence, effects  # Built by James Robert
 
 st.set_page_config(page_title="RoRants Studio", page_icon="🎙️", layout="wide")
 
-WORDS_PER_SECOND = 2.5
 ELEVENLABS_ADAM_VOICE_ID_FALLBACK = "pNInz6obpgDQGcFmaJgB"
 STOCK_PHOTO_EXCLUSION = ['freepik', 'alamy', 'shutterstock', 'gettyimages', 'stock', 'dreamstime', 'pinterest']
-
-# Gemini model IDs get deprecated/shut down frequently -- try each in order, use
-# whichever actually answers, so one dead model can't take the whole pipeline down.
 GEMINI_MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"]
 
+# Session State Setup
 DEFAULT_STATE = {
-    "final_script": "",
-    "script_editor": "",
-    "research_draft": "",
-    "source_results": [],
+    "user_script": "",
     "meme_moments": [],
     "meme_images": {},
     "audio_bytes": None,
     "audio_duration_ms": None,
-    "voice_stale": False,
-    "last_voiced_script": "",
 }
 for _key, _default in DEFAULT_STATE.items():
     if _key not in st.session_state:
         st.session_state[_key] = _default
 
-st.title("🎙️ RoRants Studio")
-st.caption("Research → exact-word-count script → word-anchored meme moments → on-demand voiceover.")
+st.title("🎙️ RoRants Studio (Direct Script Mode)")
+st.caption("Paste your raw script → auto-find word-anchored memes → generate exact-length chipmunk voiceover.")
 
 
-# ---------- Gemini helpers ----------
+# ---------- Gemini Meme Anchor Helpers ----------
 
 def _generate_with_fallback(client, prompt, json_mode=False, schema=None):
     config = types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema) if json_mode else None
@@ -60,100 +51,8 @@ def _generate_with_fallback(client, prompt, json_mode=False, schema=None):
     raise last_error
 
 
-def clean_script_text(text):
-    return (text or "").replace('*', '').replace('"', '').strip()
-
-
-def trim_to_exact_words(text, target_words):
-    """Deterministic, guaranteed-safe fallback: clip on a real word boundary, never
-    mid-word, never raises. Doesn't invent words to pad a too-short result."""
-    words = text.split()
-    if len(words) <= target_words:
-        return text
-    return " ".join(words[:target_words])
-
-
-def build_research_draft(client, category, current_year):
-    """Path A only. Grounds the script in real, current search results instead of
-    letting Gemini invent a 'controversy' from nothing."""
-    query = f"{category} Roblox controversy drama {current_year}"
-    try:
-        with DDGS() as ddg:
-            news_results = list(ddg.news(query, max_results=6))
-    except Exception:
-        news_results = []
-    try:
-        with DDGS() as ddg:
-            text_results = list(ddg.text(query, max_results=6))
-    except Exception:
-        text_results = []
-
-    combined = news_results + text_results
-    snippets = "\n".join(
-        f"- {r.get('title', '')}: {(r.get('body') or r.get('excerpt') or '')[:300]}" for r in combined
-    ) or "No search results were found for this topic."
-
-    prompt = f"""
-    Using ONLY the real information in these search snippets about "{category}" Roblox
-    drama/controversy, write a factual, grounded research draft (700-800 words)
-    summarizing what's actually happening or happened -- specific names, events, and
-    details where the snippets provide them. Do not invent facts the snippets don't
-    support. This draft will be adapted into a story script next, so include enough
-    concrete detail to write from.
-
-    Search snippets:
-    {snippets}
-    """
-    draft = clean_script_text(_generate_with_fallback(client, prompt))
-    return draft, combined
-
-
-def create_final_script(client, source_material, target_words):
-    """Up to 6 attempts to hit the exact word count directly. If none land exactly,
-    prefer the shortest candidate that's still >= target_words (clean trim-down);
-    otherwise take the longest candidate available. The deterministic trimmer is the
-    guarantee -- Gemini hitting it exactly on its own is just a nice-to-have."""
-    candidates = []
-    for _ in range(6):
-        prev_note = ""
-        if candidates:
-            prev_count = len(candidates[-1].split())
-            direction = "too long" if prev_count > target_words else "too short"
-            prev_note = f" Your previous attempt was {prev_count} words ({direction} by {abs(prev_count - target_words)}) -- correct that."
-        prompt = f"""
-        Adapt the following material into a first-person "Roblox rant" story script,
-        RoRants-style: hook in the first line, escalating story, punchy twist or payoff
-        at the end, casual Gen-Alpha slang. No emojis, stage directions, character
-        names, or brackets -- this gets read aloud by a voice engine.
-
-        Material:
-        {source_material}
-
-        The script MUST be EXACTLY {target_words} words. Count carefully before
-        answering.{prev_note}
-        Return ONLY the script text, nothing else.
-        """
-        try:
-            text = clean_script_text(_generate_with_fallback(client, prompt))
-            if text:
-                candidates.append(text)
-                if len(text.split()) == target_words:
-                    return text
-        except Exception:
-            continue
-
-    if not candidates:
-        raise RuntimeError("Gemini never returned a usable script after 6 attempts.")
-
-    over_or_equal = [c for c in candidates if len(c.split()) >= target_words]
-    best = min(over_or_equal, key=lambda c: len(c.split())) if over_or_equal else max(candidates, key=lambda c: len(c.split()))
-    return trim_to_exact_words(best, target_words)
-
-
 def find_meme_moments(client, script_text):
-    """Numbers every word so Gemini references real indices instead of guessing --
-    LLMs are unreliable at precise position-counting without this kind of scaffold.
-    Every index is still clamped afterward regardless."""
+    """Numbers every word of YOUR script so Gemini references real index placements."""
     words = script_text.split()
     if not words:
         return []
@@ -162,7 +61,7 @@ def find_meme_moments(client, script_text):
     Here is a script with each word numbered by its index, format [index]word:
     {numbered}
 
-    Identify 3 to 5 key dramatic/meme-able moments in this script. For each, return:
+    Identify 3 to 5 key dramatic or meme-able moments in this exact script. For each, return:
     - search_term: a clean 2-8 word image search query (e.g. "crying cat meme png")
     - start_anchor: the exact word text where the meme should start showing
     - end_anchor: the exact word text where it should stop showing
@@ -208,8 +107,7 @@ def find_meme_moments(client, script_text):
 
 
 def find_meme_images(query, max_results=5):
-    """Over-fetches, then filters out stock-photo domains, since those aren't memes
-    and usually aren't free to use in monetized content anyway."""
+    """Fetches non-stock meme image previews using DuckDuckGo."""
     try:
         with DDGS() as ddg:
             results = list(ddg.images(query, max_results=max_results * 3))
@@ -226,12 +124,9 @@ def find_meme_images(query, max_results=5):
     return filtered
 
 
-# ---------- ElevenLabs / audio helpers ----------
+# ---------- ElevenLabs & Audio Helpers ----------
 
 def resolve_voice_id(client, name="Adam"):
-    """Looks up the real voice_id by name; falls back to the known Adam premade ID
-    if the search call itself fails for any reason, so a lookup hiccup can't kill
-    voice generation outright."""
     try:
         results = client.voices.search(search=name)
         if results.voices:
@@ -242,9 +137,6 @@ def resolve_voice_id(client, name="Adam"):
 
 
 def chipmunk_speed(audio_segment, speed=1.15):
-    """The famous sped-up, high-pitched Adam voice: override the frame rate to play
-    back faster (pitch rises with it), then resample to a standard rate. speed=1.0
-    is a no-op."""
     if speed == 1.0:
         return audio_segment
     new_frame_rate = int(audio_segment.frame_rate * speed)
@@ -253,9 +145,7 @@ def chipmunk_speed(audio_segment, speed=1.15):
 
 
 def strip_gaps(sound):
-    """Wider silence/keep_silence window than a plain gap-strip -- keep_silence=15ms
-    was clipping word endings and gluing them into the next word once sped up. This
-    keeps enough tail on each word that the speed-up doesn't turn it into mush."""
+    """Strips silences safely without cutting off word endings."""
     chunks = silence.split_on_silence(sound, min_silence_len=200, silence_thresh=-40, keep_silence=50)
     combined = AudioSegment.empty()
     for chunk in chunks:
@@ -269,30 +159,37 @@ def _consume_audio_stream(audio_stream):
     return b"".join(audio_stream)
 
 
-def export_exact_duration_mp3(sound, target_ms, path, max_iterations=3):
-    """MP3 encoding can introduce a bit of encoder padding, so a file trimmed to
-    exactly target_ms in memory can decode back to a slightly different length once
-    it's actually an MP3 on disk. This re-decodes the real exported file and nudges
-    the trim point until the ACTUAL file matches, instead of trusting the in-memory
-    slice length."""
-    working = sound[:target_ms] if len(sound) >= target_ms else sound
-    reloaded = working
+def export_exact_duration_mp3(sound, target_ms, path, max_iterations=4):
+    """Pads short audio with trailing silence or trims long audio to match target timeline exactly."""
+    def fit_segment(seg, length):
+        if len(seg) >= length:
+            return seg[:length]
+        pad = AudioSegment.silent(
+            duration=length - len(seg),
+            frame_rate=seg.frame_rate
+        ).set_channels(seg.channels).set_sample_width(seg.sample_width)
+        return (seg + pad)[:length]
+
+    working = fit_segment(sound, target_ms)
+
     for _ in range(max_iterations):
-        working.export(path, format="mp3")
+        working.export(path, format="mp3", bitrate="128k")
         reloaded = AudioSegment.from_mp3(path)
-        drift = len(reloaded) - target_ms
+        drift = target_ms - len(reloaded)
+
         if abs(drift) <= 20:
             return reloaded, path
-        if drift > 0 and len(working) > drift:
-            working = working[: len(working) - drift]
-        else:
-            break
-    working.export(path, format="mp3")
+
+        new_length = max(1, len(working) + drift)
+        working = fit_segment(working, new_length)
+
+    working.export(path, format="mp3", bitrate="128k")
     reloaded = AudioSegment.from_mp3(path)
     return reloaded, path
 
 
 def generate_voice(eleven_client, script_text, voice_id, voice_speed, duration_seconds):
+    """Sends YOUR exact script directly to ElevenLabs without modifying a single word."""
     audio_stream = eleven_client.text_to_speech.convert(
         voice_id=voice_id, text=script_text, model_id="eleven_multilingual_v2", output_format="mp3_44100_128",
     )
@@ -313,105 +210,66 @@ def generate_voice(eleven_client, script_text, voice_id, voice_speed, duration_s
     return final_bytes, len(final_sound)
 
 
-# ---------- Sidebar ----------
+# ---------- Sidebar Controls ----------
 
 with st.sidebar:
     st.header("🔑 Engine Keys")
     gemini_key = st.text_input("Gemini API Key", type="password").strip()
     eleven_key = st.text_input("ElevenLabs API Key", type="password").strip()
 
-# ---------- Main controls + pipeline trigger ----------
+# ---------- Main Workspace ----------
 
-with st.form("pipeline_form"):
-    col_a, col_b = st.columns(2)
-    with col_a:
-        duration_seconds = st.slider("⏱️ Duration (seconds)", min_value=5, max_value=300, value=45, step=1)
-    with col_b:
-        voice_speed = st.slider("🐿️ Voice Speed", min_value=1.0, max_value=1.5, value=1.15, step=0.05)
+raw_script = st.text_area(
+    "✍️ Paste Your Script Here (Will NOT be altered or rewritten)",
+    placeholder="Throwback to when this guy...",
+    height=200
+)
 
-    target_words = int(duration_seconds * WORDS_PER_SECOND)
-    st.caption(f"Target word count for this duration: **{target_words} words**")
+col_a, col_b = st.columns(2)
+with col_a:
+    duration_seconds = st.slider("⏱️ Target Audio Duration (seconds)", min_value=5, max_value=300, value=50, step=1)
+with col_b:
+    voice_speed = st.slider("🐿️ Chipmunk Voice Speed", min_value=1.0, max_value=1.5, value=1.20, step=0.05)
 
-    event_category = st.text_input("Path A — Category / Vibe (optional)", placeholder="e.g. Roblox hacker, UGC scammer, toxic kid")
-    custom_material = st.text_area("Path B — Custom Brief / Script (optional)", placeholder="Paste your own brief or full script here. If this has text, it overrides Path A entirely.")
+word_count = len(raw_script.split())
+st.caption(f"Current word count: **{word_count} words**. (Recommended for ~{duration_seconds}s at {voice_speed}x speed: ~170–190 words).")
 
-    run_button = st.form_submit_button("🚀 RUN RORANTS STUDIO PIPELINE", use_container_width=True)
+col_btn1, col_btn2 = st.columns(2)
+with col_btn1:
+    fetch_memes = st.button("🖼️ Extract Meme Moments", use_container_width=True)
+with col_btn2:
+    run_voice = st.button("🎙️ Generate Voiceover", use_container_width=True)
 
-if run_button:
-    if not gemini_key:
-        st.error("Bro, you need your Gemini key in the sidebar first.")
+
+# ---------- Meme Extraction Trigger ----------
+
+if fetch_memes:
+    if not raw_script.strip():
+        st.error("Paste your script into the text area first!")
+    elif not gemini_key:
+        st.error("Enter your Gemini API key in the sidebar.")
     else:
-        gemini_client = genai.Client(api_key=gemini_key)
-        using_path_b = bool(custom_material.strip())
-
-        with st.spinner("Running the pipeline..."):
+        with st.spinner("Analyzing script for meme moments..."):
             try:
-                if using_path_b:
-                    st.session_state.research_draft = ""
-                    st.session_state.source_results = []
-                    source_material = custom_material.strip()
-                else:
-                    if not event_category.strip():
-                        st.error("Path A needs a Category / Vibe -- or fill in Path B with your own material instead.")
-                        st.stop()
-                    current_year = datetime.now(timezone.utc).year
-                    draft, sources = build_research_draft(gemini_client, event_category.strip(), current_year)
-                    st.session_state.research_draft = draft
-                    st.session_state.source_results = sources
-                    source_material = draft
-
-                script = create_final_script(gemini_client, source_material, target_words)
-                st.session_state.final_script = script
-                st.session_state.script_editor = script
-                st.session_state.voice_stale = bool(st.session_state.audio_bytes)
-
-                moments = find_meme_moments(gemini_client, script)
+                gemini_client = genai.Client(api_key=gemini_key)
+                moments = find_meme_moments(gemini_client, raw_script)
                 st.session_state.meme_moments = moments
                 images = {}
                 for m in moments:
                     images[m["search_term"]] = find_meme_images(m["search_term"])
                 st.session_state.meme_images = images
-
-                st.success(f"Pipeline done ({'Path B — custom material' if using_path_b else 'Path A — ' + event_category}). {len(script.split())} words, {len(moments)} meme moments found.")
+                st.success(f"Found {len(moments)} meme moments.")
             except Exception as e:
-                st.error(f"❌ Pipeline failed. Real reason: {e}")
+                st.error(f"❌ Meme extraction failed: {e}")
 
-# ---------- Research draft (Path A only) ----------
-
-if st.session_state.research_draft:
-    with st.expander("📰 Research Draft & Sources"):
-        st.write(st.session_state.research_draft)
-        if st.session_state.source_results:
-            st.caption("Sources pulled for this draft:")
-            for r in st.session_state.source_results[:10]:
-                st.markdown(f"- [{r.get('title', 'source')}]({r.get('url') or r.get('href', '#')})")
-
-# ---------- Script editor ----------
-
-if st.session_state.final_script:
-    st.subheader("📝 Script")
-
-
-    def _mark_stale():
-        st.session_state.voice_stale = True
-
-
-    st.text_area("Editable script -- editing this marks any existing voiceover as stale.",
-                  key="script_editor", height=220, on_change=_mark_stale)
-    st.caption(f"Current word count: {len(st.session_state.script_editor.split())}")
-
-    if st.session_state.voice_stale and st.session_state.audio_bytes:
-        st.warning("⚠️ Script has changed since the last voiceover. Regenerate to hear the update.")
-
-# ---------- Meme moments ----------
-
+# Display Memes
 if st.session_state.meme_moments:
     st.subheader("🖼️ Word-Anchored Meme Moments")
     for m in st.session_state.meme_moments:
         with st.expander(f"\"{m['start_anchor']}\" → \"{m['end_anchor']}\" (words {m['start_word']}-{m['end_word']}) — {m['search_term']}"):
             images = st.session_state.meme_images.get(m["search_term"], [])
             if not images:
-                st.caption("No clean (non-stock-photo) results found for this query.")
+                st.caption("No clean results found for this query.")
             else:
                 cols = st.columns(len(images))
                 for col, img in zip(cols, images):
@@ -419,31 +277,30 @@ if st.session_state.meme_moments:
                         st.image(img.get("thumbnail") or img.get("image"), use_container_width=True)
                         st.markdown(f"[Full image]({img.get('image')})")
 
-# ---------- Decoupled voice generation ----------
 
-if st.session_state.final_script:
-    st.subheader("🎙️ Voiceover")
-    voice_label = "🔄 Regenerate Voice" if st.session_state.audio_bytes else "🎙️ Generate Voiceover"
-    if st.button(voice_label):
-        if not eleven_key:
-            st.error("Bro, you need your ElevenLabs key in the sidebar first.")
-        else:
-            with st.spinner("Rendering exact-length voiceover..."):
-                try:
-                    eleven_client = ElevenLabs(api_key=eleven_key)
-                    voice_id = resolve_voice_id(eleven_client, "Adam")
-                    audio_bytes, achieved_ms = generate_voice(
-                        eleven_client, st.session_state.script_editor, voice_id, voice_speed, duration_seconds,
-                    )
-                    st.session_state.audio_bytes = audio_bytes
-                    st.session_state.audio_duration_ms = achieved_ms
-                    st.session_state.voice_stale = False
-                    st.session_state.last_voiced_script = st.session_state.script_editor
-                    st.success(f"Voice ready -- {achieved_ms / 1000:.2f}s (target was {duration_seconds}s).")
-                except Exception as e:
-                    st.error(f"❌ ElevenLabs rejected this call. Real reason: {e}")
+# ---------- Voice Generation Trigger ----------
 
-    if st.session_state.audio_bytes:
-        st.audio(st.session_state.audio_bytes, format="audio/mp3")
-        st.download_button("📥 DOWNLOAD VOICE MP3", data=st.session_state.audio_bytes,
-                            file_name="RoRants_Voice.mp3", mime="audio/mpeg")
+if run_voice:
+    if not raw_script.strip():
+        st.error("Paste your script into the text area first!")
+    elif not eleven_key:
+        st.error("Enter your ElevenLabs API key in the sidebar.")
+    else:
+        with st.spinner("Generating pitch-shifted voiceover..."):
+            try:
+                eleven_client = ElevenLabs(api_key=eleven_key)
+                voice_id = resolve_voice_id(eleven_client, "Adam")
+                audio_bytes, achieved_ms = generate_voice(
+                    eleven_client, raw_script, voice_id, voice_speed, duration_seconds
+                )
+                st.session_state.audio_bytes = audio_bytes
+                st.session_state.audio_duration_ms = achieved_ms
+                st.success(f"Voice ready — {achieved_ms / 1000:.2f}s audio generated.")
+            except Exception as e:
+                st.error(f"❌ Voice generation failed: {e}")
+
+# Display Audio Player
+if st.session_state.audio_bytes:
+    st.subheader("🎧 Voiceover Preview")
+    st.audio(st.session_state.audio_bytes, format="audio/mp3")
+    st.download_button("📥 DOWNLOAD VOICE MP3", data=st.session_state.audio_bytes, file_name="RoRants_Voice.mp3", mime="audio/mpeg")
