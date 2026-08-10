@@ -237,7 +237,7 @@ col_a, col_b = st.columns(2)
 with col_a:
     duration_seconds = st.slider("⏱️ Target Audio Duration (seconds)", min_value=5, max_value=300, value=50, step=1)
 with col_b:
-    voice_speed = st.slider("🐿️ Chipmunk Voice Speed", min_value=1.0, max_value=1.5, value=1.20, step=0.05)
+    voice_speed = st.slider("🐿️ Chipmunk Voice Speed", min_value=1.0, max_value=1.5, value=1.5, step=0.05)
 
 word_count = len(raw_script.split())
 st.caption(f"Current word count: **{word_count} words**. (Recommended for ~{duration_seconds}s at {voice_speed}x speed: ~170–190 words). "
