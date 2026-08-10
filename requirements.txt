@@ -1,10 +1,7 @@
 # Core app
 streamlit>=1.38.0
 
-# Web research (Path A) -- Built by deedy5, renamed from duckduckgo_search.
-# This scrapes DDG's HTML, not a real API, so it can break when DuckDuckGo changes
-# their page layout. Not a code bug if/when that happens, just the nature of
-# unofficial scraping.
+# Web research / meme image search -- Built by deedy5, renamed from duckduckgo_search.
 ddgs>=9.0.0
 
 # Audio processing (gap-stripping, normalize, the sped-up voice effect, exact

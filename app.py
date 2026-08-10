@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any
 
-from duckduckgo_search import DDGS  # Built by deedy5
+from ddgs import DDGS  # Built by deedy5 (renamed from duckduckgo_search)
 from google import genai  # Built by Google DeepMind
 from google.genai import types
 from elevenlabs.client import ElevenLabs  # Built by Mati Staniszewski & Piotr Dabkowski
@@ -17,9 +17,7 @@ ELEVENLABS_ADAM_VOICE_ID_FALLBACK = "pNInz6obpgDQGcFmaJgB"
 STOCK_PHOTO_EXCLUSION = ['freepik', 'alamy', 'shutterstock', 'gettyimages', 'stock', 'dreamstime', 'pinterest']
 GEMINI_MODEL_CANDIDATES = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash"]
 
-# Session State Setup
 DEFAULT_STATE = {
-    "user_script": "",
     "meme_moments": [],
     "meme_images": {},
     "audio_bytes": None,
@@ -30,7 +28,7 @@ for _key, _default in DEFAULT_STATE.items():
         st.session_state[_key] = _default
 
 st.title("🎙️ RoRants Studio (Direct Script Mode)")
-st.caption("Paste your raw script → auto-find word-anchored memes → generate exact-length chipmunk voiceover.")
+st.caption("Paste your raw script → auto-find word-anchored memes → generate voiceover.")
 
 
 # ---------- Gemini Meme Anchor Helpers ----------
@@ -160,29 +158,26 @@ def _consume_audio_stream(audio_stream):
 
 
 def export_exact_duration_mp3(sound, target_ms, path, max_iterations=4):
-    """Pads short audio with trailing silence or trims long audio to match target timeline exactly."""
-    def fit_segment(seg, length):
-        if len(seg) >= length:
-            return seg[:length]
-        pad = AudioSegment.silent(
-            duration=length - len(seg),
-            frame_rate=seg.frame_rate
-        ).set_channels(seg.channels).set_sample_width(seg.sample_width)
-        return (seg + pad)[:length]
+    """Trims down to the exact target length if there's enough audio to do that.
+    Does NOT pad short audio with silence -- that reintroduces the dead-air gaps
+    this whole pipeline exists to strip out. If the natural result is shorter than
+    the target, it's exported and returned as-is; the caller reports the honest
+    achieved duration instead of faking the number."""
+    if len(sound) < target_ms:
+        sound.export(path, format="mp3", bitrate="128k")
+        return AudioSegment.from_mp3(path), path
 
-    working = fit_segment(sound, target_ms)
-
+    working = sound[:target_ms]
     for _ in range(max_iterations):
         working.export(path, format="mp3", bitrate="128k")
         reloaded = AudioSegment.from_mp3(path)
-        drift = target_ms - len(reloaded)
-
+        drift = len(reloaded) - target_ms
         if abs(drift) <= 20:
             return reloaded, path
-
-        new_length = max(1, len(working) + drift)
-        working = fit_segment(working, new_length)
-
+        if drift > 0 and len(working) > drift:
+            working = working[: len(working) - drift]
+        else:
+            break
     working.export(path, format="mp3", bitrate="128k")
     reloaded = AudioSegment.from_mp3(path)
     return reloaded, path
@@ -232,7 +227,8 @@ with col_b:
     voice_speed = st.slider("🐿️ Chipmunk Voice Speed", min_value=1.0, max_value=1.5, value=1.20, step=0.05)
 
 word_count = len(raw_script.split())
-st.caption(f"Current word count: **{word_count} words**. (Recommended for ~{duration_seconds}s at {voice_speed}x speed: ~170–190 words).")
+st.caption(f"Current word count: **{word_count} words**. (Recommended for ~{duration_seconds}s at {voice_speed}x speed: ~170–190 words). "
+           f"This is your own script, so nothing gets padded to force that number -- too short just comes out short, honestly.")
 
 col_btn1, col_btn2 = st.columns(2)
 with col_btn1:
@@ -262,7 +258,6 @@ if fetch_memes:
             except Exception as e:
                 st.error(f"❌ Meme extraction failed: {e}")
 
-# Display Memes
 if st.session_state.meme_moments:
     st.subheader("🖼️ Word-Anchored Meme Moments")
     for m in st.session_state.meme_moments:
@@ -295,11 +290,17 @@ if run_voice:
                 )
                 st.session_state.audio_bytes = audio_bytes
                 st.session_state.audio_duration_ms = achieved_ms
-                st.success(f"Voice ready — {achieved_ms / 1000:.2f}s audio generated.")
+                achieved_seconds = achieved_ms / 1000
+                target_ms = int(duration_seconds * 1000)
+                if achieved_ms < target_ms - 20:
+                    st.warning(f"Voice ready -- but only {achieved_seconds:.2f}s naturally, short of your {duration_seconds}s target. "
+                               f"Since this is your own script, it doesn't get padded with silence to fake the length -- "
+                               f"add more to the script if you need it longer.")
+                else:
+                    st.success(f"Voice ready -- {achieved_seconds:.2f}s (target was {duration_seconds}s).")
             except Exception as e:
                 st.error(f"❌ Voice generation failed: {e}")
 
-# Display Audio Player
 if st.session_state.audio_bytes:
     st.subheader("🎧 Voiceover Preview")
     st.audio(st.session_state.audio_bytes, format="audio/mp3")
