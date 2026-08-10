@@ -1,12 +1,18 @@
 # Core app
 streamlit>=1.38.0
 
-# Audio processing
+# Web research (Path A) -- Built by deedy5, renamed from duckduckgo_search.
+# This scrapes DDG's HTML, not a real API, so it can break when DuckDuckGo changes
+# their page layout. Not a code bug if/when that happens, just the nature of
+# unofficial scraping.
+ddgs>=9.0.0
+
+# Audio processing (gap-stripping, normalize, the sped-up voice effect, exact
+# millisecond trimming)
 pydub>=0.25.1
 
 # AI engines
 google-genai>=2.0.0,<3.0.0
+# ^ replaces google-generativeai, which is fully deprecated. Do not install
+# google-generativeai.
 elevenlabs>=2.50.0,<3.0.0
-
-# Web & Meme Search Engine
-ddgs
