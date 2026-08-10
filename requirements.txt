@@ -1,15 +1,5 @@
 # Core app
 streamlit>=1.38.0
 
-# Web research / meme image search -- Built by deedy5, renamed from duckduckgo_search.
-ddgs>=9.0.0
-
-# Audio processing (gap-stripping, normalize, the sped-up voice effect, exact
-# millisecond trimming)
+# Audio processing -- gap-stripping only, no AI engines needed anymore
 pydub>=0.25.1
-
-# AI engines
-google-genai>=2.0.0,<3.0.0
-# ^ replaces google-generativeai, which is fully deprecated. Do not install
-# google-generativeai.
-elevenlabs>=2.50.0,<3.0.0
