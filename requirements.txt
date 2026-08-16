@@ -1,5 +1,8 @@
 # Core app
 streamlit>=1.38.0
 
-# Audio processing -- gap-stripping only, no AI engines needed anymore
+# Tab 1: Gap Cutter -- unchanged dependency
 pydub>=0.25.1
+
+# Tab 2: Video Enhancer uses ffmpeg directly via subprocess -- no extra Python
+# package needed, just the ffmpeg binary from packages.txt
